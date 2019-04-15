@@ -4,7 +4,7 @@
  * Dependencies:
  *   LoRa Latest by Sandeep Mistry
  *   ArduinoLog 1.0.3 by Thijs Elenbaas
- *   base64 1.0.0 by Densaugeo
+ *   base64 1.1.1 by Densaugeo
  *   ArduinoJson 6.10.0 by Benoit Blanchon
  */
 
@@ -14,14 +14,18 @@
 #include <LoRa.h>
 #include <ArduinoLog.h>
 #include <ArduinoJson.h>
-#include <gBase64.h>
+#include <base64.hpp>
 
 #define FREQUENCY 868900000
 #define SPREAD_FACTOR 12
 #define CODING_RATE4 5
+#define GPS_LAT 55
+#define GPS_LNG 37
+#define GPS_ALT 7
 // Timeouts in milliseconds
 #define PULL_DATA_INTERVAL 120000
 
+#define LORA_PUBLIC_SYNCWORD 0x34
 #define PROTOCOL_VERSION 0x02
 #define PKT_PUSH_DATA 0x00
 #define PKT_PUSH_ACK 0x01
@@ -50,6 +54,17 @@ struct DownlinkData
     uint8_t packetSize;
 };
 
+struct StatData
+{
+    uint32_t rxnb; // Number of radio packets received
+    uint32_t rxok; // Number of radio packets received with a valid PHY CRC
+    uint32_t rxfw; // Number of radio packets forwarded
+    uint32_t upnb; // Number of upstream datagrams
+    uint32_t upok; // Number of upstream datagrams that were acknowledged
+    uint32_t dwnb; // Number of downlink datagrams received
+    uint32_t txnb; // Number of packets emitted
+};
+
 const int PinCs = 16;
 const int PinReset = 0;
 const int PinIrq = 15;
@@ -61,6 +76,7 @@ WiFiUDP Udp;
 StaticJsonDocument<312> JsonDoc;
 struct UplinkData Uplink;
 struct DownlinkData Downlink;
+struct StatData Stat;
 uint8_t UdpBuffer[1024];
 byte MacAddr[6];
 uint32_t LastPullDataTime = -PULL_DATA_INTERVAL;
@@ -79,6 +95,8 @@ void OnLoraReceive(int packetSize)
         Uplink.packet[i] = LoRa.read();
     }
 
+    Stat.rxnb++;
+    Stat.rxok++;
     Uplink.rx = true;
 }
 
@@ -144,6 +162,10 @@ void RecvUdp()
         {
             Log.warning("Invalid token" CR);
         }
+        else
+        {
+            Stat.upok++;
+        }
         break;
 
     case PKT_PULL_RESP:
@@ -159,13 +181,13 @@ void RecvUdp()
         }
         root = JsonDoc.as<JsonObject>();
         data = root["txpk"]["data"];
-        base64_decode((char *)Downlink.packet, (char *)data, strlen(data));
+        decode_base64((uint8_t *)data, Downlink.packet);
         Downlink.packetSize = root["txpk"]["size"];
-        Log.verbose("Packet size: %d" CR, Downlink.packetSize);
         Downlink.tmst = root["txpk"]["tmst"].as<unsigned long>();
-        Downlink.token[1] = UdpBuffer[1];
-        Downlink.token[2] = UdpBuffer[2];
+        Downlink.token[0] = UdpBuffer[1];
+        Downlink.token[1] = UdpBuffer[2];
         Downlink.tx = true;
+        Stat.dwnb++;
         break;
 
     case PKT_PUSH_ACK:
@@ -174,6 +196,10 @@ void RecvUdp()
             (UdpBuffer[2] != LastPushDataToken[1]))
         {
             Log.warning("Invalid token" CR);
+        }
+        else
+        {
+            Stat.upok++;
         }
         break;
 
@@ -200,6 +226,7 @@ void SendPullData()
     UdpBuffer[offset++] = MacAddr[5];
 
     SendUdp(UdpBuffer, offset);
+    Stat.upnb++;
 }
 
 void SendTxAck()
@@ -207,8 +234,8 @@ void SendTxAck()
     int offset = 0;
 
     UdpBuffer[offset++] = PROTOCOL_VERSION;
+    UdpBuffer[offset++] = Downlink.token[0];
     UdpBuffer[offset++] = Downlink.token[1];
-    UdpBuffer[offset++] = Downlink.token[2];
     UdpBuffer[offset++] = PKT_TX_ACK;
     UdpBuffer[offset++] = MacAddr[0];
     UdpBuffer[offset++] = MacAddr[1];
@@ -298,11 +325,33 @@ void SendPushData()
     );
     offset += len;
 
-    len = base64_encode((char *)&UdpBuffer[offset], (char *)Uplink.packet, Uplink.packetSize);
+    len = encode_base64(Uplink.packet, Uplink.packetSize, &UdpBuffer[offset]);
     offset += len;
 
-    memcpy(&UdpBuffer[offset], "\"}]}", 4);
-    offset += 4;
+    int lat = GPS_LAT * 100000;
+    int lng = GPS_LNG * 100000;
+    Log.verbose("Stat.upok=%d, Stat.upnb=%d" CR, Stat.upok, Stat.upnb);
+    int ackr = Stat.upok * 1000 / Stat.upnb;
+
+    len = snprintf(
+        (char *)&UdpBuffer[offset],
+        sizeof(UdpBuffer) - offset,
+        "\"}],\"stat\":{\"time\":\"2019-03-20 08:59:28 GMT\",\"lati\":%d.%05d,\"long\":%d.%05d,\"alti\":%d,"
+        "\"rxnb\":%d,\"rxok\":%d,\"rxfw\":%d,\"ackr\":%d.%d,\"dwnb\":%d,\"txnb\":%d}}",
+        lat / 100000,
+        lat % 100000,
+        lng / 100000,
+        lng % 100000,
+        GPS_ALT,
+        Stat.rxnb,
+        Stat.rxok,
+        Stat.rxfw,
+        ackr / 10,
+        ackr % 10,
+        Stat.dwnb,
+        Stat.txnb
+    );
+    offset += len;
 
     UdpBuffer[offset] = '\n';
     UdpBuffer[offset + 1] = '\0';
@@ -312,17 +361,22 @@ void SendPushData()
     SendUdp(UdpBuffer, offset);
 
     DebugLoRaWanMessage(Uplink.packet);
+    Stat.upnb++;
+    Stat.rxfw++;
 }
 
 void SendDownlink()
 {
+    int diff;
+    uint32_t tNow;
+
     if (Downlink.tx == false)
     {
         return;
     }
 
-    uint32_t tNow = micros();
-    int diff = Downlink.tmst - tNow;
+    tNow = micros();
+    diff = Downlink.tmst - tNow;
     if (diff > 0)
     {
         return;
@@ -336,21 +390,20 @@ void SendDownlink()
         LoRa.write(Downlink.packet, Downlink.packetSize);
         LoRa.endPacket(true);
         Downlink.sent = true;
-        Log.verbose("Send on tmst=%l" CR, tNow);
     }
     else
     {
-        if (LoRa.beginPacket())
+        if (LoRa.beginPacket() != 0)
         {
             // tx done
             LoRa.disableInvertIQ();
             LoRa.receive();
             SendTxAck();
+            Stat.txnb++;
             Downlink.sent = false;
             Downlink.tx = false;
         }
     }
-
 }
 
 void setup()
@@ -377,6 +430,9 @@ void setup()
         delay(500);
     }
 
+    WiFi.setAutoConnect(true);
+    WiFi.setAutoReconnect(true);
+
     IPAddress localIp = WiFi.localIP();
     Log.verbose("Connected. IP address: %d.%d.%d.%d" CR,
         localIp[0], localIp[1], localIp[2], localIp[3]);
@@ -390,8 +446,10 @@ void setup()
     }
 
     LoRa.setSpreadingFactor(SPREAD_FACTOR);
+    LoRa.setSignalBandwidth(125E3);
     LoRa.setCodingRate4(CODING_RATE4);
-    LoRa.setSyncWord(0x34);
+    LoRa.setSyncWord(LORA_PUBLIC_SYNCWORD);
+    LoRa.setTxPower(14);
     LoRa.onReceive(OnLoraReceive);
     LoRa.disableInvertIQ();
     LoRa.receive();
