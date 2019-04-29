@@ -6,6 +6,8 @@
  *   ArduinoLog 1.0.3 by Thijs Elenbaas
  *   base64 1.1.1 by Densaugeo
  *   ArduinoJson 6.10.0 by Benoit Blanchon
+ *   NTPClient 3.1.0 by Fabrice Weinberg
+ *   Time 1.5.0 by Michael Margolis
  */
 
 #include <ESP8266WiFi.h>
@@ -15,6 +17,8 @@
 #include <ArduinoLog.h>
 #include <ArduinoJson.h>
 #include <base64.hpp>
+#include <NTPClient.h>
+#include <TimeLib.h>
 
 #define FREQUENCY 868900000
 #define SPREAD_FACTOR 12
@@ -22,8 +26,10 @@
 #define GPS_LAT 55
 #define GPS_LNG 37
 #define GPS_ALT 7
-// Timeouts in milliseconds
-#define PULL_DATA_INTERVAL 120000
+#define TIMEZONE_SEC (3600 * 3) // sec
+#define TIMEZONE_STR "MSK"
+#define NTP_SERVER "ru.pool.ntp.org"
+#define PULL_DATA_INTERVAL 120000 // ms
 
 #define LORA_PUBLIC_SYNCWORD 0x34
 #define PROTOCOL_VERSION 0x02
@@ -73,7 +79,9 @@ const char * WifiPassword = "PASSWORD";
 unsigned int ServerPort = 1700;
 const char * ServerHost = "your.server.com";
 WiFiUDP Udp;
+WiFiUDP NtpUDP;
 StaticJsonDocument<312> JsonDoc;
+NTPClient TimeClient(NtpUDP, NTP_SERVER, TIMEZONE_SEC, 60000 * 5);
 struct UplinkData Uplink;
 struct DownlinkData Downlink;
 struct StatData Stat;
@@ -95,8 +103,6 @@ void OnLoraReceive(int packetSize)
         Uplink.packet[i] = LoRa.read();
     }
 
-    Stat.rxnb++;
-    Stat.rxok++;
     Uplink.rx = true;
 }
 
@@ -284,14 +290,19 @@ void DebugLoRaWanMessage(const uint8_t * msg)
 
 void SendPushData()
 {
+    int ackr = 0;
     int snr;
     int len;
     int offset = 0;
+    char timestamp[32];
 
     if (Uplink.rx == false)
     {
         return;
     }
+
+    Stat.rxnb++;
+    Stat.rxok++;
 
     UdpBuffer[offset++] = PROTOCOL_VERSION;
     UdpBuffer[offset++] = LastPushDataToken[0] = (uint8_t)rand();
@@ -331,13 +342,21 @@ void SendPushData()
     int lat = GPS_LAT * 100000;
     int lng = GPS_LNG * 100000;
     Log.verbose("Stat.upok=%d, Stat.upnb=%d" CR, Stat.upok, Stat.upnb);
-    int ackr = Stat.upok * 1000 / Stat.upnb;
+    if (Stat.upnb > 0)
+    {
+        ackr = Stat.upok * 1000 / Stat.upnb;
+    }
+
+    setTime(TimeClient.getEpochTime());
+    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:%02d " TIMEZONE_STR,
+        year(), month(), day(), hour(), minute(), second());
 
     len = snprintf(
         (char *)&UdpBuffer[offset],
         sizeof(UdpBuffer) - offset,
-        "\"}],\"stat\":{\"time\":\"2019-03-20 08:59:28 GMT\",\"lati\":%d.%05d,\"long\":%d.%05d,\"alti\":%d,"
+        "\"}],\"stat\":{\"time\":\"%s\",\"lati\":%d.%05d,\"long\":%d.%05d,\"alti\":%d,"
         "\"rxnb\":%d,\"rxok\":%d,\"rxfw\":%d,\"ackr\":%d.%d,\"dwnb\":%d,\"txnb\":%d}}",
+        timestamp,
         lat / 100000,
         lat % 100000,
         lng / 100000,
@@ -353,6 +372,8 @@ void SendPushData()
     );
     offset += len;
 
+    memset(&Stat, 0, sizeof(Stat));
+
     UdpBuffer[offset] = '\n';
     UdpBuffer[offset + 1] = '\0';
     Log.verbose((char *)UdpBuffer + 12);
@@ -365,6 +386,22 @@ void SendPushData()
     Stat.rxfw++;
 }
 
+void WaitUntil(uint32_t tmst)
+{
+    int32_t delta = tmst - micros();
+
+    while (delta > 16000)
+    {
+        delay(16);
+        delta -= 16000;
+    }
+
+    if (delta > 0)
+    {
+        delayMicroseconds(delta);
+    }
+}
+
 void SendDownlink()
 {
     int diff;
@@ -375,21 +412,25 @@ void SendDownlink()
         return;
     }
 
-    tNow = micros();
-    diff = Downlink.tmst - tNow;
-    if (diff > 0)
-    {
-        return;
-    }
-
     if (Downlink.sent == false)
     {
+        tNow = micros();
+        diff = Downlink.tmst - tNow;
+        if (diff > 32000)
+        {
+            return;
+        }
+
         LoRa.idle();
         LoRa.enableInvertIQ();
         LoRa.beginPacket();
         LoRa.write(Downlink.packet, Downlink.packetSize);
+        WaitUntil(Downlink.tmst);
+        tNow = micros();
         LoRa.endPacket(true);
         Downlink.sent = true;
+        Log.verbose("Sent on: ");
+        Serial.println(tNow);
     }
     else
     {
@@ -433,6 +474,8 @@ void setup()
     WiFi.setAutoConnect(true);
     WiFi.setAutoReconnect(true);
 
+    TimeClient.begin();
+
     IPAddress localIp = WiFi.localIP();
     Log.verbose("Connected. IP address: %d.%d.%d.%d" CR,
         localIp[0], localIp[1], localIp[2], localIp[3]);
@@ -459,6 +502,8 @@ void setup()
 void loop()
 {
     uint32_t timeNow = millis();
+
+    TimeClient.update();
 
     RecvUdp();
     SendPushData();
