@@ -1,13 +1,25 @@
 /**
- * LoRaWAN Single Channel Gateway
+ * MIT License
  *
- * Dependencies:
- *   LoRa Latest by Sandeep Mistry
- *   ArduinoLog 1.0.3 by Thijs Elenbaas
- *   base64 1.1.1 by Densaugeo
- *   ArduinoJson 6.10.0 by Benoit Blanchon
- *   NTPClient 3.1.0 by Fabrice Weinberg
- *   Time 1.5.0 by Michael Margolis
+ * Copyright (c) 2022 Alexey Ryabov
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <ESP8266WiFi.h>
@@ -30,6 +42,7 @@
 #define TIMEZONE_STR "MSK"
 #define NTP_SERVER "ru.pool.ntp.org"
 #define PULL_DATA_INTERVAL 120000 // ms
+#define PUSH_STAT_DATA_INTERVAL 30000
 
 #define LORA_PUBLIC_SYNCWORD 0x34
 #define PROTOCOL_VERSION 0x02
@@ -77,7 +90,7 @@ const int PinIrq = 15;
 const char * WifiSsid = "SSID";
 const char * WifiPassword = "PASSWORD";
 unsigned int ServerPort = 1700;
-const char * ServerHost = "your.server.com";
+const char * ServerHost = "eu1.cloud.thethings.network";
 WiFiUDP Udp;
 WiFiUDP NtpUDP;
 StaticJsonDocument<312> JsonDoc;
@@ -88,6 +101,7 @@ struct StatData Stat;
 uint8_t UdpBuffer[1024];
 byte MacAddr[6];
 uint32_t LastPullDataTime = -PULL_DATA_INTERVAL;
+uint32_t LastPushStatDataTime;
 uint8_t LastPullToken[2];
 uint8_t LastPushDataToken[2];
 
@@ -386,6 +400,69 @@ void SendPushData()
     Stat.rxfw++;
 }
 
+void SendStat()
+{
+    int ackr = 0;
+    int len;
+    int offset = 0;
+    char timestamp[32];
+
+    UdpBuffer[offset++] = PROTOCOL_VERSION;
+    UdpBuffer[offset++] = LastPushDataToken[0] = (uint8_t)rand();
+    UdpBuffer[offset++] = LastPushDataToken[1] = (uint8_t)rand();
+    UdpBuffer[offset++] = PKT_PUSH_DATA;
+    UdpBuffer[offset++] = MacAddr[0];
+    UdpBuffer[offset++] = MacAddr[1];
+    UdpBuffer[offset++] = MacAddr[2];
+    UdpBuffer[offset++] = 0xff;
+    UdpBuffer[offset++] = 0xff;
+    UdpBuffer[offset++] = MacAddr[3];
+    UdpBuffer[offset++] = MacAddr[4];
+    UdpBuffer[offset++] = MacAddr[5];
+
+    int lat = GPS_LAT * 100000;
+    int lng = GPS_LNG * 100000;
+    Log.verbose("Stat.upok=%d, Stat.upnb=%d" CR, Stat.upok, Stat.upnb);
+    if (Stat.upnb > 0)
+    {
+        ackr = Stat.upok * 1000 / Stat.upnb;
+    }
+
+    setTime(TimeClient.getEpochTime());
+    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:%02d " TIMEZONE_STR,
+        year(), month(), day(), hour(), minute(), second());
+
+    len = snprintf(
+        (char *)&UdpBuffer[offset],
+        sizeof(UdpBuffer) - offset,
+        "{\"stat\":{\"time\":\"%s\",\"lati\":%d.%05d,\"long\":%d.%05d,\"alti\":%d,"
+        "\"rxnb\":%d,\"rxok\":%d,\"rxfw\":%d,\"ackr\":%d.%d,\"dwnb\":%d,\"txnb\":%d}}",
+        timestamp,
+        lat / 100000,
+        lat % 100000,
+        lng / 100000,
+        lng % 100000,
+        GPS_ALT,
+        Stat.rxnb,
+        Stat.rxok,
+        Stat.rxfw,
+        ackr / 10,
+        ackr % 10,
+        Stat.dwnb,
+        Stat.txnb
+    );
+    offset += len;
+
+    memset(&Stat, 0, sizeof(Stat));
+
+    UdpBuffer[offset] = '\n';
+    UdpBuffer[offset + 1] = '\0';
+    Log.verbose((char *)UdpBuffer + 12);
+
+    SendUdp(UdpBuffer, offset);
+    Stat.upnb++;
+}
+
 void WaitUntil(uint32_t tmst)
 {
     int32_t delta = tmst - micros();
@@ -516,4 +593,9 @@ void loop()
         SendPullData();
     }
 
+    if ((timeNow - LastPushStatDataTime) > PUSH_STAT_DATA_INTERVAL)
+    {
+        LastPushStatDataTime = timeNow;
+        SendStat();
+    }
 }
